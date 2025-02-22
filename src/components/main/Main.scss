@@ -20,10 +20,33 @@
 
 .has-call-header {
   --call-header-height: 2rem;
-
+  
   #LeftColumn, #MiddleColumn, #RightColumn-wrapper {
     height: calc(100% - var(--call-header-height));
     margin-top: var(--call-header-height);
+  }
+}
+
+#FoldersColumn {
+  width: 5rem;
+  background-color: #212121;
+  position: relative;
+  display: none;
+  flex-direction: column;
+}
+
+#FoldersColumn > .custom-scroll {
+  overflow-y: scroll;
+  flex: 1;
+  height: 100%;
+}
+
+#Main.has-folders {
+  @media (min-width: 926px) {
+    grid-template-columns: auto auto 1fr;
+    #FoldersColumn {
+      display: flex;
+    }
   }
 }
 
