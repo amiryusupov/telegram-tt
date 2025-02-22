@@ -10,3 +10,9 @@ export default function jsxToHtml(jsx: VirtualElement) {
 
   return children;
 }
+
+export function jsxToHtmlText(jsx: VirtualElement) {
+  const fragment = document.createElement('div');
+  TeactDOM.render(jsx, fragment);
+  return fragment.innerHTML;
+}

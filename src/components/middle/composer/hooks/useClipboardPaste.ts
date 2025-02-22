@@ -60,9 +60,7 @@ const useClipboardPaste = (
       const pastedText = e.clipboardData.getData('text');
       const html = e.clipboardData.getData('text/html');
 
-      let pastedFormattedText = html ? parseHtmlAsFormattedText(
-        preparePastedHtml(html), undefined, true,
-      ) : undefined;
+      let pastedFormattedText = parseHtmlAsFormattedText(pastedText, undefined, false);
 
       if (pastedFormattedText && containsCustomEmoji(pastedFormattedText) && shouldStripCustomEmoji) {
         pastedFormattedText = stripCustomEmoji(pastedFormattedText);

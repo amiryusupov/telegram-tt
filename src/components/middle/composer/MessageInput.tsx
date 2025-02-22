@@ -2,24 +2,32 @@ import type { ChangeEvent, RefObject } from 'react';
 import type { FC } from '../../../lib/teact/teact';
 import React, {
   getIsHeavyAnimating,
-  memo, useEffect, useLayoutEffect,
-  useRef, useState,
+  memo, useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
 } from '../../../lib/teact/teact';
 import { getActions, withGlobal } from '../../../global';
 
 import type { ApiInputMessageReplyInfo } from '../../../api/types';
 import type { IAnchorPosition, ISettings, ThreadId } from '../../../types';
 import type { Signal } from '../../../util/signals';
+import type { UndoManager } from '../../../util/undoManager';
 
 import { EDITABLE_INPUT_ID } from '../../../config';
 import { requestForcedReflow, requestMutation } from '../../../lib/fasterdom/fasterdom';
-import { selectCanPlayAnimatedEmojis, selectDraft, selectIsInSelectMode } from '../../../global/selectors';
+import {
+  selectCanPlayAnimatedEmojis, selectDraft, selectIsInSelectMode,
+} from '../../../global/selectors';
 import buildClassName from '../../../util/buildClassName';
 import captureKeyboardListeners from '../../../util/captureKeyboardListeners';
 import { getIsDirectTextInputDisabled } from '../../../util/directInputManager';
 import parseEmojiOnlyString from '../../../util/emoji/parseEmojiOnlyString';
 import focusEditableElement from '../../../util/focusEditableElement';
+import { htmlToMarkdown, isHtml, TG_TAGS } from '../../../util/markdown/htmlToMarkdown';
 import { debounce } from '../../../util/schedulers';
+import { getSelectedText, getSelectionRangePosition, setSelectionRangePosition } from '../../../util/selection';
 import {
   IS_ANDROID, IS_EMOJI_SUPPORTED, IS_IOS, IS_TOUCH_ENV,
 } from '../../../util/windowEnvironment';
@@ -75,6 +83,7 @@ type OwnProps = {
   onFocus?: NoneToVoidFunction;
   onBlur?: NoneToVoidFunction;
   isNeedPremium?: boolean;
+  undoManager?: UndoManager;
 };
 
 type StateProps = {
@@ -96,19 +105,9 @@ const IGNORE_KEYS = [
   'Esc', 'Escape', 'Enter', 'PageUp', 'PageDown', 'Meta', 'Alt', 'Ctrl', 'ArrowDown', 'ArrowUp', 'Control', 'Shift',
 ];
 
-function clearSelection() {
-  const selection = window.getSelection();
-  if (!selection) {
-    return;
-  }
-
-  if (selection.removeAllRanges) {
-    selection.removeAllRanges();
-  } else if (selection.empty) {
-    selection.empty();
-  }
+export function getInputScroller(input: HTMLDivElement | null) {
+  return input!.closest<HTMLDivElement>(`.${SCROLLER_CLASS}`);
 }
-
 const MessageInput: FC<OwnProps & StateProps> = ({
   ref,
   id,
@@ -141,6 +140,7 @@ const MessageInput: FC<OwnProps & StateProps> = ({
   onFocus,
   onBlur,
   isNeedPremium,
+  undoManager,
 }) => {
   const {
     editLastMessage,
@@ -179,6 +179,20 @@ const MessageInput: FC<OwnProps & StateProps> = ({
 
   const [shouldDisplayTimer, setShouldDisplayTimer] = useState(false);
 
+  function clearSelection() {
+    const selection = window.getSelection();
+    if (!selection) {
+      return;
+    }
+    if (undoManager && inputRef.current && selection.rangeCount > 0) {
+      undoManager.add(inputRef.current.innerHTML, 0, 0);
+    }
+    if (selection.removeAllRanges) {
+      selection.removeAllRanges();
+    } else if (selection.empty) {
+      selection.empty();
+    }
+  }
   useEffect(() => {
     setShouldDisplayTimer(Boolean(timedPlaceholderLangKey && timedPlaceholderDate));
   }, [timedPlaceholderDate, timedPlaceholderLangKey]);
@@ -204,7 +218,7 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     : isStoryInput ? MAX_STORY_MODAL_INPUT_HEIGHT : (isMobile ? 256 : 416);
   const updateInputHeight = useLastCallback((willSend = false) => {
     requestForcedReflow(() => {
-      const scroller = inputRef.current!.closest<HTMLDivElement>(`.${SCROLLER_CLASS}`)!;
+      const scroller = getInputScroller(inputRef.current)!;
       const currentHeight = Number(scroller.style.height.replace('px', ''));
       const clone = scrollerCloneRef.current!;
       const { scrollHeight } = clone;
@@ -279,7 +293,7 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     clearSelection();
   });
 
-  function checkSelection() {
+  const checkSelection = useCallback(() => {
     // Disable the formatter on iOS devices for now.
     if (IS_IOS) {
       return false;
@@ -308,37 +322,40 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     }
 
     return true;
-  }
+  }, [editableInputId, shouldSuppressTextFormatter]);
 
-  function processSelection() {
+  const processSelection = useCallback(() => {
     if (!checkSelection()) {
       return;
     }
-
+    if (undoManager && inputRef.current) {
+      const [start, end] = getSelectionRangePosition(inputRef.current);
+      undoManager.setSelection(start, end);
+    }
     if (isTextFormatterDisabled) {
       return;
     }
-
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      return;
+    }
+    const scroller = getInputScroller(inputRef.current)!;
     const selectionRange = window.getSelection()!.getRangeAt(0);
     const selectionRect = selectionRange.getBoundingClientRect();
-    const scrollerRect = inputRef.current!.closest<HTMLDivElement>(`.${SCROLLER_CLASS}`)!.getBoundingClientRect();
+    const scrollerRect = scroller!.getBoundingClientRect();
 
     let x = (selectionRect.left + selectionRect.width / 2) - scrollerRect.left;
-
+    const y = Math.min(scrollerRect.height, Math.max(0, selectionRect.top - scrollerRect.top));
     if (x < TEXT_FORMATTER_SAFE_AREA_PX) {
       x = TEXT_FORMATTER_SAFE_AREA_PX;
     } else if (x > scrollerRect.width - TEXT_FORMATTER_SAFE_AREA_PX) {
       x = scrollerRect.width - TEXT_FORMATTER_SAFE_AREA_PX;
     }
 
-    setTextFormatterAnchorPosition({
-      x,
-      y: selectionRect.top - scrollerRect.top,
-    });
-
+    setTextFormatterAnchorPosition({ x, y });
     setSelectedRange(selectionRange);
     openTextFormatter();
-  }
+  }, [checkSelection, isTextFormatterDisabled, undoManager]);
 
   function processSelectionWithTimeout() {
     if (selectionTimeoutRef.current) {
@@ -383,6 +400,24 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     // https://levelup.gitconnected.com/javascript-events-handlers-keyboard-and-load-events-1b3e46a6b0c3#1960
     const { isComposing } = e;
 
+    const input = e.currentTarget;
+    if (input && undoManager && e.ctrlKey && e.code === 'KeyZ') {
+      const state = e.shiftKey ? undoManager.redo() : undoManager.undo();
+      if (state) {
+        input.innerHTML = state.text!;
+        if (state.start !== undefined && state.end !== undefined) {
+          setSelectionRangePosition(input, state.start!, state.end!);
+        }
+        if (state.scroll !== undefined) {
+          getInputScroller(input)!.scrollTop = state.scroll;
+        }
+        processSelection();
+        onUpdate(input.innerHTML);
+      }
+      e.preventDefault();
+      return;
+    }
+
     const html = getHtml();
     if (!isComposing && !html && (e.metaKey || e.ctrlKey)) {
       const targetIndexDelta = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : undefined;
@@ -393,7 +428,6 @@ const MessageInput: FC<OwnProps & StateProps> = ({
         return;
       }
     }
-
     if (!isComposing && e.key === 'Enter' && !e.shiftKey) {
       if (
         !isMobileDevice
@@ -415,9 +449,26 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     }
   }
 
+  useEffect(() => {
+    const handleScroll = (e: Event): void => {
+      const s = getInputScroller(inputRef.current);
+      if (s && s === e.target && undoManager) {
+        undoManager.setScroll(s.scrollTop);
+        processSelection();
+      }
+    };
+    document.addEventListener('scroll', handleScroll, true);
+    return () => {
+      document.removeEventListener('scroll', handleScroll, true);
+    };
+  }, [undoManager, processSelection]);
+
   function handleChange(e: ChangeEvent<HTMLDivElement>) {
     const { innerHTML, textContent } = e.currentTarget;
 
+    if (undoManager) {
+      undoManager.add(innerHTML);
+    }
     onUpdate(innerHTML === SAFARI_BR ? '' : innerHTML);
 
     // Reset focus on the input to remove any active styling when input is cleared
@@ -471,6 +522,18 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     }
   }, [chatId, focusInput, replyInfo, canAutoFocus]);
 
+  function handleCopy(e: React.ClipboardEvent<HTMLDivElement>) {
+    if (!e.clipboardData) {
+      return;
+    }
+    const html = getSelectedText()!;
+    if (isHtml(html)) {
+      e.preventDefault();
+      const text = htmlToMarkdown(html, TG_TAGS);
+      e.clipboardData.setData('text', text);
+    }
+  }
+
   useEffect(() => {
     if (
       !chatId
@@ -496,7 +559,6 @@ const MessageInput: FC<OwnProps & StateProps> = ({
 
       const input = inputRef.current!;
       const isSelectionCollapsed = document.getSelection()?.isCollapsed;
-
       if (
         ((key.startsWith('Arrow') || (e.shiftKey && key === 'Shift')) && !isSelectionCollapsed)
         || (e.code === 'KeyC' && (e.ctrlKey || e.metaKey) && target.tagName !== 'INPUT')
@@ -523,7 +585,7 @@ const MessageInput: FC<OwnProps & StateProps> = ({
     return () => {
       document.removeEventListener('keydown', handleDocumentKeyDown, true);
     };
-  }, [chatId, editableInputId, isMobileDevice, isSelectModeActive, noFocusInterception]);
+  }, [chatId, editableInputId, isMobileDevice, isSelectModeActive, noFocusInterception, onUpdate, undoManager]);
 
   useEffect(() => {
     const captureFirstTab = debounce((e: KeyboardEvent) => {
@@ -581,6 +643,7 @@ const MessageInput: FC<OwnProps & StateProps> = ({
             onClick={focusInput}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
+            onCopy={handleCopy}
             onMouseDown={handleMouseDown}
             onContextMenu={IS_ANDROID ? handleAndroidContextMenu : undefined}
             onTouchCancel={IS_ANDROID ? processSelectionWithTimeout : undefined}
@@ -631,11 +694,16 @@ const MessageInput: FC<OwnProps & StateProps> = ({
         </div>
       )}
       <TextFormatter
+        inputDiv={inputRef!.current}
+        editableInputId={editableInputId || EDITABLE_INPUT_ID}
         isOpen={isTextFormatterOpen}
         anchorPosition={textFormatterAnchorPosition}
         selectedRange={selectedRange}
+        undoManager={undoManager}
         setSelectedRange={setSelectedRange}
         onClose={handleCloseTextFormatter}
+        onUpdate={onUpdate}
+        processSelection={processSelection}
       />
       {forcedPlaceholder && <span className="forced-placeholder">{renderText(forcedPlaceholder!)}</span>}
     </div>
@@ -645,7 +713,6 @@ const MessageInput: FC<OwnProps & StateProps> = ({
 export default memo(withGlobal<OwnProps>(
   (global, { chatId, threadId }: OwnProps): StateProps => {
     const { messageSendKeyCombo } = global.settings.byKey;
-
     return {
       messageSendKeyCombo,
       replyInfo: chatId && threadId ? selectDraft(global, chatId, threadId)?.replyInfo : undefined,

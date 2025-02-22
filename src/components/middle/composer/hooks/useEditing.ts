@@ -1,7 +1,7 @@
 import { useEffect, useState } from '../../../../lib/teact/teact';
 import { getActions } from '../../../../global';
 
-import type { ApiDraft, ApiFormattedText, ApiMessage } from '../../../../api/types';
+import type { ApiChat, ApiDraft, ApiFormattedText, ApiMessage } from '../../../../api/types';
 import type { MessageListType, ThreadId } from '../../../../types';
 import type { Signal } from '../../../../util/signals';
 import { ApiMessageEntityTypes } from '../../../../api/types';
@@ -12,7 +12,7 @@ import { hasMessageMedia } from '../../../../global/helpers';
 import focusEditableElement from '../../../../util/focusEditableElement';
 import parseHtmlAsFormattedText from '../../../../util/parseHtmlAsFormattedText';
 import { getTextWithEntitiesAsHtml } from '../../../common/helpers/renderTextWithEntities';
-
+import { UndoManager } from '../../../../util/undoManager';
 import { useDebouncedResolver } from '../../../../hooks/useAsyncResolvers';
 import useDerivedSignal from '../../../../hooks/useDerivedSignal';
 import useEffectWithPrevDeps from '../../../../hooks/useEffectWithPrevDeps';
@@ -31,6 +31,7 @@ const useEditing = (
   chatId: string,
   threadId: ThreadId,
   type: MessageListType,
+  chat?: ApiChat,
   draft?: ApiDraft,
   editingDraft?: ApiFormattedText,
 ): [VoidFunction, VoidFunction, boolean] => {
@@ -57,8 +58,10 @@ const useEditing = (
     }
 
     const text = !prevEditedMessage && editingDraft?.text.length ? editingDraft : editedMessage.content.text;
-    const html = getTextWithEntitiesAsHtml(text);
-
+    const html = getTextWithEntitiesAsHtml(text).replace(/&lt;br&gt;/g, '\n');
+    if (chat) {
+      chat.undoData = UndoManager.cteateData(html);
+    }
     setHtml(html);
     setShouldForceShowEditing(true);
 

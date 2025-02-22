@@ -4,13 +4,14 @@ import React, {
 } from '../../../lib/teact/teact';
 
 import type { IAnchorPosition } from '../../../types';
+import type { UndoManager } from '../../../util/undoManager';
 import { ApiMessageEntityTypes } from '../../../api/types';
 
-import { EDITABLE_INPUT_ID } from '../../../config';
 import buildClassName from '../../../util/buildClassName';
 import captureEscKeyListener from '../../../util/captureEscKeyListener';
 import { ensureProtocol } from '../../../util/ensureProtocol';
 import getKeyFromEvent from '../../../util/getKeyFromEvent';
+import { getSelectionRangePosition, setSelectionRangePosition } from '../../../util/selection';
 import stopEvent from '../../../util/stopEvent';
 import { INPUT_CUSTOM_EMOJI_SELECTOR } from './helpers/customEmoji';
 
@@ -20,19 +21,25 @@ import useOldLang from '../../../hooks/useOldLang';
 import useShowTransitionDeprecated from '../../../hooks/useShowTransitionDeprecated';
 import useVirtualBackdrop from '../../../hooks/useVirtualBackdrop';
 
+import codeBlockHtml from '../../common/code/CodeBlock';
 import Icon from '../../common/icons/Icon';
 import Button from '../../ui/Button';
+import { getInputScroller } from './MessageInput';
 
 import './TextFormatter.scss';
 
 export type OwnProps = {
+  inputDiv?: HTMLDivElement | null;
   isOpen: boolean;
   anchorPosition?: IAnchorPosition;
   selectedRange?: Range;
+  undoManager?: UndoManager;
+  editableInputId: string;
   setSelectedRange: (range: Range) => void;
   onClose: () => void;
+  onUpdate: (html: string) => void;
+  processSelection: () => void;
 };
-
 interface ISelectedTextFormats {
   bold?: boolean;
   italic?: boolean;
@@ -40,7 +47,21 @@ interface ISelectedTextFormats {
   strikethrough?: boolean;
   monospace?: boolean;
   spoiler?: boolean;
+  quote?: boolean;
+  code?: boolean;
+  link?: boolean;
 }
+
+enum TextFormats {
+  bold = 'bold', italic = 'italic', underline = 'underline', strikethrough = 'strikethrough',
+  monospace = 'monospace', spoiler = 'spoiler', quote = 'quote', code = 'code', link = 'link',
+}
+const DEFAULT_TEXT_FORMATS: Record<string, TextFormats> = {
+  bold: TextFormats.bold,
+  italic: TextFormats.italic,
+  underline: TextFormats.underline,
+  strikethrough: TextFormats.strikethrough,
+};
 
 const TEXT_FORMAT_BY_TAG_NAME: Record<string, keyof ISelectedTextFormats> = {
   B: 'bold',
@@ -49,17 +70,29 @@ const TEXT_FORMAT_BY_TAG_NAME: Record<string, keyof ISelectedTextFormats> = {
   EM: 'italic',
   U: 'underline',
   DEL: 'strikethrough',
+  STRIKE: 'strikethrough',
   CODE: 'monospace',
   SPAN: 'spoiler',
+  BLOCKQUOTE: 'quote',
+  PRE: 'code',
+};
+export type TextFormatHandler = {
+  handler: AnyToVoidFunction;
+  format: keyof ISelectedTextFormats;
 };
 const fragmentEl = document.createElement('div');
 
 const TextFormatter: FC<OwnProps> = ({
+  inputDiv,
   isOpen,
   anchorPosition,
+  undoManager,
   selectedRange,
+  editableInputId,
   setSelectedRange,
   onClose,
+  onUpdate,
+  processSelection,
 }) => {
   // eslint-disable-next-line no-null/no-null
   const containerRef = useRef<HTMLDivElement>(null);
@@ -103,18 +136,21 @@ const TextFormatter: FC<OwnProps> = ({
     }
 
     const selectedFormats: ISelectedTextFormats = {};
-    let { parentElement } = selectedRange.commonAncestorContainer;
-    while (parentElement && parentElement.id !== EDITABLE_INPUT_ID) {
+    let parentElement = selectedRange.commonAncestorContainer as HTMLElement;
+    const content = selectedRange.cloneContents();
+    if (content.children.length <= 1) {
+      parentElement = selectedRange.endContainer as HTMLElement;
+    }
+    while (parentElement && parentElement.id !== editableInputId) {
       const textFormat = TEXT_FORMAT_BY_TAG_NAME[parentElement.tagName];
       if (textFormat) {
         selectedFormats[textFormat] = true;
       }
-
-      parentElement = parentElement.parentElement;
+      parentElement = parentElement.parentElement!;
     }
 
     setSelectedTextFormats(selectedFormats);
-  }, [isOpen, selectedRange, openLinkControl]);
+  }, [isOpen, selectedRange, openLinkControl, editableInputId]);
 
   const restoreSelection = useLastCallback(() => {
     if (!selectedRange) {
@@ -128,18 +164,29 @@ const TextFormatter: FC<OwnProps> = ({
     }
   });
 
-  const updateSelectedRange = useLastCallback(() => {
-    const selection = window.getSelection();
-    if (selection) {
-      setSelectedRange(selection.getRangeAt(0));
+  const getInput = useLastCallback(() => {
+    if (inputDiv) {
+      return inputDiv;
     }
+    if (selectedRange) {
+      let element : HTMLElement | null = selectedRange.commonAncestorContainer as HTMLElement;
+      while (element && element.id !== editableInputId) {
+        element = element.parentElement;
+      }
+      return element;
+    }
+    return document.querySelector(editableInputId);
   });
-
   const getSelectedText = useLastCallback((shouldDropCustomEmoji?: boolean) => {
     if (!selectedRange) {
       return undefined;
     }
-    fragmentEl.replaceChildren(selectedRange.cloneContents());
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount >= 0) {
+      fragmentEl.replaceChildren(selection.getRangeAt(0).cloneContents());
+    } else {
+      fragmentEl.replaceChildren(selectedRange.cloneContents());
+    }
     if (shouldDropCustomEmoji) {
       fragmentEl.querySelectorAll(INPUT_CUSTOM_EMOJI_SELECTOR).forEach((el) => {
         el.replaceWith(el.getAttribute('alt')!);
@@ -157,12 +204,12 @@ const TextFormatter: FC<OwnProps> = ({
   });
 
   function updateInputStyles() {
-    const input = linkUrlInputRef.current;
-    if (!input) {
+    const linkInput = linkUrlInputRef.current;
+    if (!linkInput) {
       return;
     }
 
-    const { offsetWidth, scrollWidth, scrollLeft } = input;
+    const { offsetWidth, scrollWidth, scrollLeft } = linkInput;
     if (scrollWidth <= offsetWidth) {
       setInputClassName(undefined);
       return;
@@ -188,136 +235,214 @@ const TextFormatter: FC<OwnProps> = ({
     if (selectedTextFormats[key]) {
       return 'active';
     }
-
-    if (key === 'monospace' || key === 'strikethrough') {
-      if (Object.keys(selectedTextFormats).some(
-        (fKey) => fKey !== key && Boolean(selectedTextFormats[fKey as keyof ISelectedTextFormats]),
-      )) {
-        return 'disabled';
-      }
-    } else if (selectedTextFormats.monospace || selectedTextFormats.strikethrough) {
+    if (selectedTextFormats.code || selectedTextFormats.monospace) {
       return 'disabled';
     }
-
+    switch (key) {
+      case 'code':
+        if (selectedTextFormats.quote) {
+          return 'disabled';
+        }
+        break;
+      case 'monospace':
+        if (selectedTextFormats.bold || selectedTextFormats.italic || selectedTextFormats.strikethrough || selectedTextFormats.underline) {
+          return 'disabled';
+        }
+        break;
+    }
+    const element = getSelectedElement();
+    if (element && element.classList.contains('code-title')) {
+      return 'disabled';
+    }
     return undefined;
   }
-
-  const handleSpoilerText = useLastCallback(() => {
-    if (selectedTextFormats.spoiler) {
-      const element = getSelectedElement();
-      if (
-        !selectedRange
-        || !element
-        || element.dataset.entityType !== ApiMessageEntityTypes.Spoiler
-        || !element.textContent
-      ) {
-        return;
+  function selectText2(node: HTMLElement | null | undefined) {
+    if (!node) return;
+    const parent = node.parentElement;
+    const selection = window.getSelection();
+    if (selection && parent) {
+      const range = document!.createRange();
+      if (parent.childNodes.length > 0) {
+        const index = Array.from(parent.childNodes).indexOf(node);
+        range.setStart(parent, index);
+        range.setEnd(parent, index + 1);
       }
-
-      element.replaceWith(element.textContent);
-      setSelectedTextFormats((selectedFormats) => ({
-        ...selectedFormats,
-        spoiler: false,
-      }));
-
-      return;
+      selection.removeAllRanges();
+      selection.addRange(range);
     }
+  }
+  function selectText(node: HTMLElement | null | undefined) {
+    if (!node) return;
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document!.createRange();
 
-    const text = getSelectedText();
-    document.execCommand(
-      'insertHTML', false, `<span class="spoiler" data-entity-type="${ApiMessageEntityTypes.Spoiler}">${text}</span>`,
-    );
-    onClose();
-  });
-
-  const handleBoldText = useLastCallback(() => {
+      if (node.childNodes.length === 1 && node.firstChild && node.firstChild.nodeType === Node.TEXT_NODE) {
+        range.setStart(node.firstChild, 0);
+        range.setEnd(node.firstChild, node.firstChild.textContent!.length);
+      } else {
+        range.setStart(node, 0);
+        range.setEnd(node, node.childNodes.length);
+      }
+      selection.removeAllRanges();
+      selection.addRange(range!);
+    }
+  }
+  const handleUpdateFormat = useLastCallback((format: TextFormats) => {
     setSelectedTextFormats((selectedFormats) => {
-      // Somehow re-applying 'bold' command to already bold text doesn't work
-      document.execCommand(selectedFormats.bold ? 'removeFormat' : 'bold');
-      Object.keys(selectedFormats).forEach((key) => {
-        if ((key === 'italic' || key === 'underline') && Boolean(selectedFormats[key])) {
-          document.execCommand(key);
+      const f = Boolean(selectedFormats[format]);
+      const defFolmat = DEFAULT_TEXT_FORMATS[format];
+      const input = getInput();
+      // eslint-disable-next-line prefer-const
+      let [start, end, allText] = getSelectionRangePosition(input, true);
+      if (undoManager) {
+        undoManager.add(input.innerHTML, start, end, getInputScroller(input)?.scrollTop);
+      }
+      if (f) {
+        selectedFormats[format] = false;
+        if (defFolmat) {
+          document.execCommand('removeFormat');
+          Object.keys(selectedFormats).forEach((key) => {
+            const fkey = DEFAULT_TEXT_FORMATS[key];
+            if (fkey && Boolean(selectedFormats[fkey])) {
+              document.execCommand(fkey);
+            }
+          });
+        } else {
+          const range = window.getSelection()?.getRangeAt(0);
+          if (format === TextFormats.code) {
+            let parentElement = range!.endContainer as HTMLElement;
+            while (parentElement && parentElement.id !== editableInputId) {
+              if (!parentElement.className || !parentElement.classList.contains('CodeBlock')) {
+                parentElement = parentElement.parentElement!;
+                continue;
+              }
+              for (const child of parentElement.children) {
+                if (child.tagName === 'PRE') {
+                  if (child instanceof HTMLElement && child.dataset.language) {
+                    start -= child.dataset.language.length;
+                    end -= child.dataset.language.length;
+                  }
+                  parentElement.replaceWith(child.textContent!);
+                  if (undoManager) {
+                    undoManager.setSelection(start, end);
+                    undoManager.add(input.innerHTML);
+                  }
+                  onUpdate(input.innerHTML!);
+                  break;
+                }
+              }
+              break;
+            }
+          } else {
+            let parentElement = range!.endContainer as HTMLElement;
+            while (parentElement && parentElement.id !== editableInputId) {
+              if (TEXT_FORMAT_BY_TAG_NAME[parentElement.tagName] !== format) {
+                parentElement = parentElement.parentElement!;
+                continue;
+              }
+              if (undoManager) {
+                parentElement.replaceWith(parentElement.innerText);
+                if (undoManager) {
+                  undoManager.add(input.innerHTML);
+                }
+                onUpdate(input.innerHTML!);
+              } else {
+                selectText2(parentElement);
+                const parent = parentElement.parentElement!;
+                const parentHtml = parent.innerHTML;
+                const innter = parentHtml?.replace(getSelectedText()!, parentElement.innerHTML);
+                selectText(parent);
+                document.execCommand('insertHTML', false, innter);
+                if (parent.innerHTML === parentHtml) {
+                  parentElement.replaceWith(parentElement.innerText);
+                  onUpdate(input?.innerHTML!);
+                }
+              }
+              break;
+            }
+          }
         }
-      });
-
-      updateSelectedRange();
+      } else if (defFolmat) {
+        document.execCommand(format);
+      } else {
+        const text = getSelectedText();
+        if (text) {
+          switch (format) {
+            case TextFormats.monospace:
+              document.execCommand('insertHTML', false, `<code class="text-entity-code" dir="auto">${text}</code>`);
+              break;
+            case TextFormats.quote:
+            case TextFormats.code: {
+              const sch = allText.charAt(start - 1);
+              const ech = allText.length > end ? allText.charAt(end) : '';
+              let n = '';
+              if (sch !== '\n') {
+                start += 1;
+                end += 1;
+                n = '\n';
+              }
+              if (format === TextFormats.quote) {
+                if (undoManager) {
+                  undoManager.setSelection(start, end);
+                }
+                const e = ech === '\n' ? '' : '\n';
+                document.execCommand('insertHTML', false, `${n}<blockquote >${text}</blockquote>${e}`);
+              } else {
+                const lang = 'TypeScript';
+                start += lang.length;
+                end += lang.length;
+                if (undoManager) {
+                  undoManager.setSelection(start, end);
+                }
+                document.execCommand('insertHTML', false, `${n}${codeBlockHtml(text, lang)}`);
+              }
+            }
+              break;
+            case TextFormats.spoiler:
+              document.execCommand('insertHTML', false, `<span class="spoiler" data-entity-type="${ApiMessageEntityTypes.Spoiler}">${text}</span>`);
+              break;
+          }
+        }
+      }
+      setSelectionRangePosition(input, start, end);
+      processSelection();
       return {
         ...selectedFormats,
-        bold: !selectedFormats.bold,
+        [format]: !f,
       };
     });
   });
+  const handleSpoilerText = useLastCallback(() => {
+    handleUpdateFormat(TextFormats.spoiler);
+  });
+  const handleBoldText = useLastCallback(() => {
+    handleUpdateFormat(TextFormats.bold);
+  });
 
   const handleItalicText = useLastCallback(() => {
-    document.execCommand('italic');
-    updateSelectedRange();
-    setSelectedTextFormats((selectedFormats) => ({
-      ...selectedFormats,
-      italic: !selectedFormats.italic,
-    }));
+    handleUpdateFormat(TextFormats.italic);
   });
 
   const handleUnderlineText = useLastCallback(() => {
-    document.execCommand('underline');
-    updateSelectedRange();
-    setSelectedTextFormats((selectedFormats) => ({
-      ...selectedFormats,
-      underline: !selectedFormats.underline,
-    }));
+    handleUpdateFormat(TextFormats.underline);
   });
 
   const handleStrikethroughText = useLastCallback(() => {
-    if (selectedTextFormats.strikethrough) {
-      const element = getSelectedElement();
-      if (
-        !selectedRange
-        || !element
-        || element.tagName !== 'DEL'
-        || !element.textContent
-      ) {
-        return;
-      }
-
-      element.replaceWith(element.textContent);
-      setSelectedTextFormats((selectedFormats) => ({
-        ...selectedFormats,
-        strikethrough: false,
-      }));
-
-      return;
-    }
-
-    const text = getSelectedText();
-    document.execCommand('insertHTML', false, `<del>${text}</del>`);
-    onClose();
+    handleUpdateFormat(TextFormats.strikethrough);
   });
 
   const handleMonospaceText = useLastCallback(() => {
-    if (selectedTextFormats.monospace) {
-      const element = getSelectedElement();
-      if (
-        !selectedRange
-        || !element
-        || element.tagName !== 'CODE'
-        || !element.textContent
-      ) {
-        return;
-      }
-
-      element.replaceWith(element.textContent);
-      setSelectedTextFormats((selectedFormats) => ({
-        ...selectedFormats,
-        monospace: false,
-      }));
-
-      return;
-    }
-
-    const text = getSelectedText(true);
-    document.execCommand('insertHTML', false, `<code class="text-entity-code" dir="auto">${text}</code>`);
-    onClose();
+    handleUpdateFormat(TextFormats.monospace);
   });
 
+  const handleQuoteText = useLastCallback(() => {
+    handleUpdateFormat(TextFormats.quote);
+  });
+
+  const handleCodeText = useLastCallback(() => {
+    handleUpdateFormat(TextFormats.code);
+  });
   const handleLinkUrlConfirm = useLastCallback(() => {
     const formattedLinkUrl = (ensureProtocol(linkUrl) || '').split('%').map(encodeURI).join('%');
 
@@ -326,50 +451,50 @@ const TextFormatter: FC<OwnProps> = ({
       if (!element || element.tagName !== 'A') {
         return;
       }
-
       (element as HTMLAnchorElement).href = formattedLinkUrl;
-
       onClose();
-
       return;
     }
-
-    const text = getSelectedText(true);
     restoreSelection();
+    const text = getSelectedText(true);
     document.execCommand(
       'insertHTML',
       false,
       `<a href=${formattedLinkUrl} class="text-entity-link" dir="auto">${text}</a>`,
     );
+
     onClose();
   });
 
   const handleKeyDown = useLastCallback((e: KeyboardEvent) => {
-    const HANDLERS_BY_KEY: Record<string, AnyToVoidFunction> = {
-      k: openLinkControl,
-      b: handleBoldText,
-      u: handleUnderlineText,
-      i: handleItalicText,
-      m: handleMonospaceText,
-      s: handleStrikethroughText,
-      p: handleSpoilerText,
+    const HANDLERS_BY_KEY: Record<string, TextFormatHandler> = {
+      k: { handler: openLinkControl, format: 'link' },
+      b: { handler: handleBoldText, format: 'bold' },
+      u: { handler: handleUnderlineText, format: 'underline' },
+      i: { handler: handleItalicText, format: 'italic' },
+      m: { handler: handleMonospaceText, format: 'monospace' },
+      s: { handler: handleStrikethroughText, format: 'strikethrough' },
+      q: { handler: handleQuoteText, format: 'quote' },
+      o: { handler: handleCodeText, format: 'code' },
+      p: { handler: handleSpoilerText, format: 'spoiler' },
     };
 
-    const handler = HANDLERS_BY_KEY[getKeyFromEvent(e)];
+    const fh = HANDLERS_BY_KEY[getKeyFromEvent(e)];
 
     if (
       e.altKey
       || !(e.ctrlKey || e.metaKey)
-      || !handler
+      || !fh
     ) {
       return;
     }
-
     e.preventDefault();
     e.stopPropagation();
-    handler();
+    if (getFormatButtonClassName(fh.format) === 'disabled') {
+      return;
+    }
+    fh.handler();
   });
-
   useEffect(() => {
     if (isOpen) {
       document.addEventListener('keydown', handleKeyDown);
@@ -390,7 +515,6 @@ const TextFormatter: FC<OwnProps> = ({
   if (!shouldRender) {
     return undefined;
   }
-
   const className = buildClassName(
     'TextFormatter',
     transitionClassNames,
@@ -405,7 +529,6 @@ const TextFormatter: FC<OwnProps> = ({
   const style = anchorPosition
     ? `left: ${anchorPosition.x}px; top: ${anchorPosition.y}px;--text-formatter-left: ${anchorPosition.x}px;`
     : '';
-
   return (
     <div
       ref={containerRef}
@@ -418,7 +541,7 @@ const TextFormatter: FC<OwnProps> = ({
       <div className="TextFormatter-buttons">
         <Button
           color="translucent"
-          ariaLabel="Spoiler text"
+          ariaLabel={lang('lng_menu_formatting_spoiler')}
           className={getFormatButtonClassName('spoiler')}
           onClick={handleSpoilerText}
         >
@@ -427,7 +550,7 @@ const TextFormatter: FC<OwnProps> = ({
         <div className="TextFormatter-divider" />
         <Button
           color="translucent"
-          ariaLabel="Bold text"
+          ariaLabel={lang('lng_menu_formatting_bold')}
           className={getFormatButtonClassName('bold')}
           onClick={handleBoldText}
         >
@@ -435,7 +558,7 @@ const TextFormatter: FC<OwnProps> = ({
         </Button>
         <Button
           color="translucent"
-          ariaLabel="Italic text"
+          ariaLabel={lang('lng_menu_formatting_italic')}
           className={getFormatButtonClassName('italic')}
           onClick={handleItalicText}
         >
@@ -443,7 +566,7 @@ const TextFormatter: FC<OwnProps> = ({
         </Button>
         <Button
           color="translucent"
-          ariaLabel="Underlined text"
+          ariaLabel={lang('lng_menu_formatting_underline')}
           className={getFormatButtonClassName('underline')}
           onClick={handleUnderlineText}
         >
@@ -451,7 +574,7 @@ const TextFormatter: FC<OwnProps> = ({
         </Button>
         <Button
           color="translucent"
-          ariaLabel="Strikethrough text"
+          ariaLabel={lang('lng_menu_formatting_strike_out')}
           className={getFormatButtonClassName('strikethrough')}
           onClick={handleStrikethroughText}
         >
@@ -459,14 +582,35 @@ const TextFormatter: FC<OwnProps> = ({
         </Button>
         <Button
           color="translucent"
-          ariaLabel="Monospace text"
+          ariaLabel={lang('lng_menu_formatting_monospace')}
           className={getFormatButtonClassName('monospace')}
           onClick={handleMonospaceText}
         >
           <Icon name="monospace" />
         </Button>
+        <Button
+          color="translucent"
+          ariaLabel="Code block text"
+          className={getFormatButtonClassName('code')}
+          onClick={handleCodeText}
+        >
+          <Icon name="code-block" />
+        </Button>
+        <Button
+          color="translucent"
+          ariaLabel={lang('lng_menu_formatting_blockquote')}
+          className={getFormatButtonClassName('quote')}
+          onClick={handleQuoteText}
+        >
+          <Icon name="quote" />
+        </Button>
         <div className="TextFormatter-divider" />
-        <Button color="translucent" ariaLabel={lang('TextFormat.AddLinkTitle')} onClick={openLinkControl}>
+        <Button
+          color="translucent"
+          ariaLabel={lang('TextFormat.AddLinkTitle')}
+          className={getFormatButtonClassName('link')}
+          onClick={openLinkControl}
+        >
           <Icon name="link" />
         </Button>
       </div>

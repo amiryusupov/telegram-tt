@@ -16,6 +16,7 @@ type ApiChatType = (
 export type ApiPeer = ApiChat | ApiUser;
 
 export interface ApiChat {
+  undoData: { stack: never[]; index: number; limit: number; };
   id: string;
   folderId?: number;
   type: ApiChatType;
